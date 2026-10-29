@@ -1,0 +1,1208 @@
+---
+title: "GSB 544 PA 10.2 Penalized Regression"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+
+
+So far we have approached feature selection---that is, selection of which ${\bf X}$ variables to based our predictions on---by considering several subsets of features and comparing scores. But what if we want to consider *all* of the features? We don't necessarily want to select all the features to include in our model, because we run the risk of overfitting to the training data. But maybe we want to *consider* every feature for selection rather than just a few subsets. Penalized regression is one way of performing de facto feature selection: throw all the available features into the model and let the model fitting sort out which to include.
+
+```{python}
+import pandas as pd
+import numpy as np
+from sklearn.pipeline import Pipeline
+from sklearn.compose import make_column_selector, ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, PolynomialFeatures
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from sklearn.model_selection import cross_val_score
+from sklearn.metrics import r2_score
+```
+
+We'll use the Ames housing data. We'll do a little cleaning first to:
+
+- Drop a few columns that have mostly missing values
+- Drop a few rows with missing values
+- Drop the ID columns (row order and PID)
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 478}
+ames = pd.read_csv("https://raw.githubusercontent.com/kevindavisross/data301/main/data/AmesHousing.txt", sep="\t")
+
+# Get rid of columns with mostly NaN values
+good_cols = ames.isna().sum() < 100
+ames = ames.loc[:,good_cols]
+
+# Drop other NAs
+ames = ames.dropna()
+
+# drop ID columns and put target in y
+X = ames.drop(["SalePrice", "Order", "PID"], axis = 1)
+y = ames["SalePrice"]
+
+X
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 458}
+y
+```
+
+Let's try a linear regression model first. We'll standardize numerical predictors and dummify categorical predictors.
+
+```{python}
+ct = ColumnTransformer(
+  [
+    ("dummify",
+    OneHotEncoder(sparse_output = False, handle_unknown='ignore'),
+    make_column_selector(dtype_include=object)),
+    ("standardize",
+    StandardScaler(),
+    make_column_selector(dtype_include=np.number))
+  ],
+  remainder = "passthrough"
+).set_output(transform="pandas")
+```
+
+```{python}
+lr_pipeline = Pipeline(
+  [("preprocessing", ct),
+  ("linear_regression", LinearRegression())]
+)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 247}
+lr_pipeline.fit(X, y)
+```
+
+Now let's use cross-validation to evaluate based on $R^2$.
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+cross_val_score(lr_pipeline, X, y, cv = 10, scoring = 'r2')
+```
+
+Hmmm... linear regression on all the predictors does not seem as bad as the textbook suggests, though there is considerably variability between the scores based on the different folds.
+
+Let's add second degree polynomial terms for all numerical predictors and see what happens.
+
+```{python}
+numeric_poly = Pipeline([
+    ("polynomial_features", PolynomialFeatures(degree=2)),
+    ("standardize", StandardScaler())
+])
+
+ct_poly = ColumnTransformer(
+    [
+        ("dummify",
+         OneHotEncoder(sparse_output=False, handle_unknown="ignore"),
+         make_column_selector(dtype_include=object)),
+
+        ("numeric_poly",
+         numeric_poly,
+         make_column_selector(dtype_include=np.number))
+    ],
+    remainder="drop"
+).set_output(transform="pandas")
+```
+
+```{python}
+poly_pipeline = Pipeline(
+  [("preprocessing", ct_poly),
+  ("linear_regression", LinearRegression())]
+)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 287}
+poly_pipeline.fit(X, y)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+cross_val_score(poly_pipeline, X, y, cv = 10, scoring = 'r2')
+```
+
+OK, now that's bad. The moral is that just throwing in all the predictors might fit the training data well but can be pretty terrible when it comes to making predictions for new observations. We want to be more selective without having to laboriously search through all the possible subsets of predictors. With 67 predictors there are $2^{67}\approx 10^{20}$ possible subsets---even before we consider polynomial terms, interactions, transformations, etc---so it would be impossible to fit every possible subset.
+
+Instead, we include all predictors but "penalize" variables that don't contribute much to the model. Before getting to the penalty we'll consider some motivating conceptual questions.
+
+1. Consider a simple linear regression of sale price on a single variable like living area. What is the process by which the coefficient for living area is determined? How does "least squares" work? **DISCUSS**
+
+Least squares determines the coefficient for living area by finding the slope and intercept that minimize the sum of squared residuals (RSS), which are the differences between actual and predicted sale prices.
+
+2. Now consider a multiple of regression on living area and number of bedrooms, without standardizing variables. How does least squares work in this case? **DISCUSS**
+
+Least squares works the same way as simple linear regression, but now it finds multiple coefficients simultaneously to minimize the sum of squared residuals (RSS).
+
+3. If you fit the linear model, without standarizing variables, how do you interpret the coefficients for living area and number of bedrooms? What is their rough order of magnitude? Can we determine directly from the coefficients which variable the predicted prices are more sensitive to? **DISCUSS**
+
+Each coefficient represents the predicted change in sale price for a one-unit increase in that variable, holding the other variables constant.
+
+4. If you standardize the variables first, how would you interpret the model coefficients? How could you determine, roughly, which variable the predicted prices are more sensitive to? **DISCUSS**
+
+After standardization, each coefficient represents the predicted change in sale price for a one-standard-deviation increase in that predictor, holding other variables constant.
+
+5. If we want to make the predictions *less* sensitive to a particular standardized variable, what in principle should we do to its coefficient? **DISCUSS**
+
+Reduce the absolute magnitude of that variable's coefficient, bringing it closer to zero.
+
+6. If we want to make the predictions *not at all* sensitive to a particular standardized variable, what in principle should we do to its coefficient? **DISCUSS**
+
+Set the variable's coefficient equal to zero. This removes its influence on predictions because changes in that variable will no longer affect the predicted outcome.
+
+7. Why does including a penalty like in ridge regression or LASSO "shrink" coefficients towards 0? **DISCUSS**
+
+Ridge and LASSO add a penalty for large coefficients to the ordinary least squares objective. To minimize the total objective, the model balances prediction accuracy with keeping coefficients small.
+
+8. Why is it important to standarize variables when using a penalty? **DISCUSS**
+
+Standardization puts all predictors on the same scale, ensuring the penalty treats them fairly.
+
+9. What happens if the penalty parameter $\lambda$ is 0? **DISCUSS**
+
+When lambda=0, there is no penalty, so Ridge and LASSO reduce to the ordinary least squares (OLS) objective.
+
+10. What happens as the penalty parameter $\lambda$ gets larger and larger? **DISCUSS**
+
+As lambda increases, regularization becomes stronger, forcing coefficients closer to zero.
+
+11. Why do we not penalize the intercept? **DISCUSS**
+
+The intercept represents the baseline prediction when all predictors equal zero. We do not penalize it because we want the model to freely estimate the baseline value without forcing it toward zero.
+
+12. Assume $\lambda = 1$. Suppose a standardized predictor has a small coefficient, say $\beta = 0.1$. How much does that coefficient add to the LASSO penalty versus the ridge penalty? If the coefficient were reduced from 0.1 to 0, how much would each penalty decrease? Which penalty offers a larger payoff for eliminating a small coefficient entirely? **DISCUSS**
+
+When lambda=1 and beta=0.1, LASSO produces a larger penalty than Ridge.
+
+- Ridge regression shrinks all coefficient estimates toward zero but typically keeps every predictor in the model.
+- LASSO regression shrinks coefficients and can set some exactly to zero, automatically removing those predictors.
+- Choose ridge when predictors are highly correlated and you think many of them contain useful predictive information. Ridge tends to share influence among correlated variables.
+- Choose LASSO when you want a simpler, more interpretable model with automatic variable selection.
+- With highly correlated predictors, LASSO may keep one and drop the others—sometimes somewhat arbitrarily—while ridge usually retains all of them with smaller coefficients.
+- Both methods are useful when there are many predictors or when ordinary least squares may overfit.
+
+**Note that in scikit-learn the penalty parameter $\lambda$ is called `alpha`.**
+
+## Ridge Regression
+
+Let's fit regression regression first.
+
+```{python}
+ridge_pipeline = Pipeline(
+  [("preprocessing", ct),
+  ("ridge_regression", Ridge(alpha=1))]
+)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 247}
+ridge_pipeline.fit(X, y)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+cross_val_score(ridge_pipeline, X, y, cv = 10, scoring = 'r2')
+```
+
+There are a lot of predictors so there are a lot of coefficients. The code below is just an illustration of how the coefficients in the ridge regression model compare to the original linear regression model.
+
+```{python}
+coef_compare = pd.DataFrame()
+coef_compare["feature"] = lr_pipeline.named_steps["preprocessing"].get_feature_names_out()
+
+coef_compare["lr"] = lr_pipeline.named_steps['linear_regression'].coef_
+coef_compare["ridge"] = ridge_pipeline.named_steps['ridge_regression'].coef_
+coef_compare["diff"] = abs(coef_compare["lr"]) - abs(coef_compare["ridge"])
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 423}
+coef_compare.sort_values(by = "diff", ascending=False)
+```
+
+Let's add a ridge penalty to the polynomial regression
+
+```{python}
+ridge_poly_pipeline = Pipeline(
+  [("preprocessing", ct_poly),
+  ("ridge_regression", Ridge(alpha=1))]
+)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 287}
+ridge_poly_pipeline.fit(X, y)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+cross_val_score(ridge_poly_pipeline, X, y, cv = 10, scoring = 'r2')
+```
+
+```{python}
+poly_coef_compare = pd.DataFrame()
+
+poly_coef_compare["feature"] = poly_pipeline.named_steps["preprocessing"].get_feature_names_out()
+
+poly_coef_compare["lr_poly"] = poly_pipeline.named_steps["linear_regression"].coef_
+poly_coef_compare["ridge_poly"] = ridge_poly_pipeline.named_steps["ridge_regression"].coef_
+
+poly_coef_compare["diff_poly"] = (
+    poly_coef_compare["lr_poly"].abs()
+    - poly_coef_compare["ridge_poly"].abs()
+)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 423}
+poly_coef_compare.sort_values(by = "diff_poly", ascending=False)
+```
+
+## LASSO
+
+Now let's try LASSO
+
+```{python}
+lasso_pipeline = Pipeline(
+  [("preprocessing", ct),
+  ("lasso_regression", Lasso(alpha=1))]
+)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 247}
+lasso_pipeline.fit(X, y)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+cross_val_score(lasso_pipeline, X, y, cv = 10, scoring = 'r2')
+```
+
+```{python}
+coef_compare["lasso"] = lasso_pipeline.named_steps['lasso_regression'].coef_
+coef_compare["ridge_lasso_diff"] = abs(coef_compare["ridge"]) - abs(coef_compare["lasso"])
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 423}
+coef_compare.sort_values(by = "ridge_lasso_diff", ascending=False)
+```
+
+How many ridge coefficients are 0?
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+(coef_compare["ridge"] == 0).sum()
+```
+
+How many LASSO coefficients are 0?
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+(coef_compare["lasso"] == 0).sum()
+```
+
+Let's add a lasso penalty to the polynomial regression
+
+```{python}
+lasso_poly_pipeline = Pipeline(
+  [("preprocessing", ct_poly),
+  ("lasso_regression", Lasso(alpha=1))]
+)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 342}
+lasso_poly_pipeline.fit(X, y)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+cross_val_score(lasso_poly_pipeline, X, y, cv = 10, scoring = 'r2')
+```
+
+```{python}
+poly_coef_compare["lasso_poly"] = lasso_poly_pipeline.named_steps["lasso_regression"].coef_
+
+poly_coef_compare["ridge_lasso_diff_poly"] = (
+    poly_coef_compare["ridge_poly"].abs()
+    - poly_coef_compare["lasso_poly"].abs()
+)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 423}
+poly_coef_compare.sort_values(by = "ridge_lasso_diff_poly", ascending=False)
+```
+
+How many ridge coefficients are 0?
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+(poly_coef_compare["ridge_poly"] == 0).sum()
+```
+
+How many LASSO coefficients are 0?
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+(poly_coef_compare["lasso_poly"] == 0).sum()
+```
+
+## Grid search on `alpha` parameter
+
+Note that useful values of `alpha` to consider depend on the scale of the $y$ variable.
+
+```{python}
+from sklearn.model_selection import GridSearchCV
+
+lasso_pipeline = Pipeline(
+  [("preprocessing", ct),
+  ("lasso_regression", Lasso(alpha = 1))]
+).set_output(transform="pandas")
+
+alphas = {'lasso_regression__alpha': np.array([10000, 1000, 100, 10, 1])}
+
+gscv = GridSearchCV(lasso_pipeline, param_grid=alphas, cv = 10, scoring='r2')
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+gscv_fitted = gscv.fit(X, y)
+
+gscv_fitted.cv_results_
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 313}
+df_cv_results_ = pd.DataFrame(gscv_fitted.cv_results_)
+
+df_cv_results_
+```
+
+## Elastic Net
+
+- Elastic net combines ridge and LASSO penalties, so it both shrinks coefficients and can set some coefficients exactly to zero.
+- It is often preferred when you want variable selection but also have strongly correlated predictors.
+- Unlike LASSO, elastic net tends to keep correlated predictors together rather than choosing one and discarding the others.
+- It has two tuning choices: the overall penalty strength and the balance between ridge-like shrinkage and LASSO-like variable selection.
+- Think of it as a middle ground: ridge keeps all predictors, LASSO selects a sparse subset, and elastic net can select groups of useful predictors while dropping clearly unhelpful ones.
+
+```{python}
+elastic_pipeline = Pipeline(
+  [("preprocessing", ct),
+  ("elastic_net", ElasticNet(alpha=1, l1_ratio=0.5))]
+)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+cross_val_score(elastic_pipeline, X, y, cv = 10, scoring = 'r2')
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 247}
+elastic_pipeline.fit(X, y)
+```
+
+## Elastic Net: Grid search
+
+```{python}
+elastic_pipeline_1 = Pipeline(
+  [("preprocessing", ct),
+  ("elastic_net", ElasticNet())]
+).set_output(transform="pandas")
+
+param_grid = {
+    "elastic_net__alpha": [1, 10, 100],
+    "elastic_net__l1_ratio": np.arange(0.0, 1.2, 0.2),
+}
+
+gscv = GridSearchCV(elastic_pipeline_1, param_grid=param_grid, cv = 5, scoring='r2')
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+gscv_fitted = gscv.fit(X, y)
+
+gscv_fitted.cv_results_
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 1000}
+df_cv_results_ = pd.DataFrame(gscv_fitted.cv_results_)
+
+df_cv_results_
+```
+
+```{python}
+y_pred = gscv_fitted.predict(X)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 423}
+target = pd.DataFrame()
+
+target["actual"] = y
+target["predicted"] = y_pred
+
+target
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 466}
+target.plot.scatter(x = "actual", y = "predicted")
+```
+
+
+## Practice Activity
+
+## Loans Data
+
+The loans data set represents thousands of loans made through the Lending Club platform, which is a platform that allows individuals to lend to other individuals. Of course, not all loans are created equal. Someone who is a essentially a sure bet to pay back a loan will have an easier time getting a loan with a low interest rate than someone who appears to be riskier. And for people who are very risky? They may not even get a loan offer, or they may not have accepted the loan offer due to a high interest rate. It is important to keep that last part in mind, since this dataset only represents loans actually made, i.e. do not mistake this data for loan applications!
+
+[Some information about the data set is here](https://openintrostat.github.io/openintro/reference/loans_full_schema.html). There are also some related exercises in this [OpenIntro textbook](https://openintro-ims.netlify.app/inf-model-mlr.html).
+
+**Our goal will be to develop a regression model for predicting `interest_rate`.**
+
+We will have a competition to see who can come up with the model with the smallest test RMSE. Fit several models and try to find the smallest test RMSE. When you think you have a good one, share your model and its test RMSE. Then see what other people have done; can you do even better?
+
+**Previously you considered selected subsets of features. Now you should try, Ridge, LASSO, and elastic net.**
+
+You should use `GridSearchCV` to tune at least one parameter.
+
+Note: you should do some exploration of the data first before you start fitting models.
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 565}
+df = pd.read_csv("https://raw.githubusercontent.com/kevindavisross/data301/refs/heads/main/data/loans_full_schema.csv")
+
+df
+```
+
+```{python}
+# Practice Activity: Explore Loans Data
+
+print("Dataset Shape:")
+print(df.shape)
+
+print("\nColumn Names:")
+print(df.columns.tolist())
+
+print("\nTarget Variable Summary:")
+print(df["interest_rate"].describe())
+
+print("\nMissing Values:")
+print(df.isnull().sum().sort_values(ascending=False))
+
+print("\nData Types:")
+print(df.dtypes.value_counts())
+
+print("\nDuplicate Rows:")
+print(df.duplicated().sum())
+
+print("\nInterest Rate Distribution:")
+df["interest_rate"].hist(bins=30)
+```
+
+```{python}
+# Practice Activity: Baseline Linear Regression
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
+
+# Remove target and columns that may cause leakage
+drop_cols = [
+    "interest_rate",
+    "Unnamed: 0",
+    "installment",
+    "grade",
+    "sub_grade",
+    "loan_status",
+    "balance",
+    "paid_total",
+    "paid_principal",
+    "paid_interest",
+    "paid_late_fees",
+    "emp_title",
+    "earliest_credit_line",
+    "issue_month",
+    "initial_listing_status",
+    "disbursement_method"
+]
+
+X = df.drop(columns=drop_cols)
+y = df["interest_rate"]
+
+# Train/test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, random_state=42
+)
+
+# Identify numerical and categorical columns
+num_cols = X.select_dtypes(include=np.number).columns
+cat_cols = X.select_dtypes(exclude=np.number).columns
+
+# Numerical preprocessing
+num_transformer = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+# Categorical preprocessing
+cat_transformer = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore"))
+])
+
+# Combine preprocessing
+preprocessor = ColumnTransformer([
+    ("num", num_transformer, num_cols),
+    ("cat", cat_transformer, cat_cols)
+])
+
+# Baseline model
+baseline = Pipeline([
+    ("preprocessing", preprocessor),
+    ("model", LinearRegression())
+])
+
+baseline.fit(X_train, y_train)
+
+# Predictions
+train_pred = baseline.predict(X_train)
+test_pred = baseline.predict(X_test)
+
+# RMSE
+train_rmse = np.sqrt(mean_squared_error(y_train, train_pred))
+test_rmse = np.sqrt(mean_squared_error(y_test, test_pred))
+
+print("Baseline Linear Regression")
+print("Training RMSE:", round(train_rmse, 4))
+print("Test RMSE:", round(test_rmse, 4))
+```
+
+```{python}
+# Practice Activity: Penalized Regression Models
+
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.model_selection import GridSearchCV
+
+# Models and hyperparameter grids
+models = {
+    "Ridge": (
+        Ridge(),
+        {"model__alpha": [0.01, 0.1, 1, 10, 100, 1000]}
+    ),
+    "LASSO": (
+        Lasso(max_iter=20000),
+        {"model__alpha": [0.003, 0.01, 0.03, 0.1, 0.3, 1]}
+    ),
+    "Elastic Net": (
+        ElasticNet(max_iter=20000),
+        {
+            "model__alpha": [0.003, 0.03, 0.3, 3],
+            "model__l1_ratio": [0.2, 0.5, 0.8, 0.95]
+        }
+    )
+}
+
+results = []
+
+# Include baseline for comparison
+results.append({
+    "Model": "Linear Regression",
+    "Train RMSE": train_rmse,
+    "Test RMSE": test_rmse,
+    "Best Parameters": "None"
+})
+
+best_models = {}
+
+# Fit and evaluate each model
+for name, (model, params) in models.items():
+
+    pipeline = Pipeline([
+        ("preprocessing", preprocessor),
+        ("model", model)
+    ])
+
+    grid = GridSearchCV(
+        pipeline,
+        param_grid=params,
+        cv=5,
+        scoring="neg_root_mean_squared_error",
+        n_jobs=-1
+    )
+
+    grid.fit(X_train, y_train)
+
+    best_models[name] = grid.best_estimator_
+
+    train_predictions = grid.predict(X_train)
+    test_predictions = grid.predict(X_test)
+
+    train_score = np.sqrt(
+        mean_squared_error(y_train, train_predictions)
+    )
+
+    test_score = np.sqrt(
+        mean_squared_error(y_test, test_predictions)
+    )
+
+    results.append({
+        "Model": name,
+        "Train RMSE": train_score,
+        "Test RMSE": test_score,
+        "Best Parameters": grid.best_params_
+    })
+
+    print(f"\n{name}")
+    print("Best Parameters:", grid.best_params_)
+    print("Cross-Validation RMSE:", round(-grid.best_score_, 4))
+    print("Training RMSE:", round(train_score, 4))
+    print("Test RMSE:", round(test_score, 4))
+
+# Compare all models
+results_df = pd.DataFrame(results)
+
+results_df = results_df.sort_values("Test RMSE")
+
+print("\nMODEL COMPARISON")
+display(results_df)
+
+print("\nLowest Test RMSE:")
+print(results_df.iloc[0]["Model"])
+print(round(results_df.iloc[0]["Test RMSE"], 4))
+```
+
+```{python}
+# Practice Activity: Fine-Tune Penalized Regression
+
+fine_grids = {
+    "Ridge": (
+        Ridge(),
+        {"model__alpha": [25, 50, 75, 100, 150, 250, 500]}
+    ),
+    "LASSO": (
+        Lasso(max_iter=30000),
+        {"model__alpha": [
+            0.002, 0.005, 0.0075, 0.01,
+            0.015, 0.02, 0.03, 0.05
+        ]}
+    ),
+    "Elastic Net": (
+        ElasticNet(max_iter=30000),
+        {
+            "model__alpha": [
+                0.005, 0.01, 0.02, 0.03, 0.05, 0.08
+            ],
+            "model__l1_ratio": [
+                0.1, 0.2, 0.3, 0.5, 0.7, 0.9
+            ]
+        }
+    )
+}
+
+fine_results = []
+fine_best_models = {}
+
+for name, (model, params) in fine_grids.items():
+
+    pipeline = Pipeline([
+        ("preprocessing", preprocessor),
+        ("model", model)
+    ])
+
+    search = GridSearchCV(
+        pipeline,
+        param_grid=params,
+        cv=5,
+        scoring="neg_root_mean_squared_error",
+        n_jobs=-1
+    )
+
+    search.fit(X_train, y_train)
+
+    fine_best_models[name] = search.best_estimator_
+
+    train_rmse_new = np.sqrt(mean_squared_error(
+        y_train, search.predict(X_train)
+    ))
+
+    fine_results.append({
+        "Model": name,
+        "CV RMSE": -search.best_score_,
+        "Train RMSE": train_rmse_new,
+        "Best Parameters": search.best_params_
+    })
+
+fine_df = pd.DataFrame(fine_results)
+fine_df = fine_df.sort_values("CV RMSE")
+
+print("FINE-TUNED MODEL COMPARISON")
+print(fine_df.to_string(index=False))
+
+# Select winner using cross-validation
+winner = fine_df.iloc[0]["Model"]
+winner_model = fine_best_models[winner]
+
+# Evaluate winner on held-out test data
+winner_predictions = winner_model.predict(X_test)
+
+winner_test_rmse = np.sqrt(mean_squared_error(
+    y_test, winner_predictions
+))
+
+print("\nBest Model:", winner)
+print("Best CV RMSE:", round(fine_df.iloc[0]["CV RMSE"], 4))
+print("Test RMSE:", round(winner_test_rmse, 4))
+print("Previous Best Test RMSE: 4.0971")
+```
+
+```{python}
+# Practice Activity: Feature Engineering Experiments
+
+from sklearn.preprocessing import SplineTransformer
+
+# Create additional predictors
+def add_features(data):
+    x = data.copy()
+
+    x["loan_income_ratio"] = (
+        x["loan_amount"] /
+        x["annual_income"].replace(0, np.nan)
+    )
+
+    x["credit_utilization_ratio"] = (
+        x["total_credit_utilized"] /
+        x["total_credit_limit"].replace(0, np.nan)
+    )
+
+    x["available_credit"] = (
+        x["total_credit_limit"] -
+        x["total_credit_utilized"]
+    )
+
+    x["loan_per_credit_line"] = (
+        x["loan_amount"] /
+        (x["open_credit_lines"] + 1)
+    )
+
+    x["log_income"] = np.log1p(
+        x["annual_income"].clip(lower=0)
+    )
+
+    x["log_loan_amount"] = np.log1p(
+        x["loan_amount"].clip(lower=0)
+    )
+
+    return x.replace([np.inf, -np.inf], np.nan)
+
+# Apply identical transformations to training and test data
+X_train_eng = add_features(X_train)
+X_test_eng = add_features(X_test)
+
+num_eng = X_train_eng.select_dtypes(
+    include=np.number
+).columns.tolist()
+
+cat_eng = X_train_eng.select_dtypes(
+    exclude=np.number
+).columns.tolist()
+
+# Standard preprocessing
+basic_prep = ColumnTransformer([
+    ("num", num_transformer, num_eng),
+    ("cat", cat_transformer, cat_eng)
+])
+
+# Nonlinear spline features for selected predictors
+spline_cols = [
+    "annual_income",
+    "loan_amount",
+    "debt_to_income",
+    "total_credit_limit",
+    "total_credit_utilized",
+    "inquiries_last_12m"
+]
+
+spline_pipeline = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("spline", SplineTransformer(
+        n_knots=5,
+        degree=2
+    )),
+    ("scaler", StandardScaler())
+])
+
+spline_prep = ColumnTransformer([
+    ("num", num_transformer, num_eng),
+    ("cat", cat_transformer, cat_eng),
+    ("spline", spline_pipeline, spline_cols)
+])
+
+# Experiment with four approaches
+experiments = {
+    "Engineered LASSO": (
+        basic_prep,
+        Lasso(max_iter=30000),
+        {"model__alpha": [
+            0.003, 0.005, 0.01, 0.015, 0.03
+        ]}
+    ),
+
+    "Engineered Ridge": (
+        basic_prep,
+        Ridge(),
+        {"model__alpha": [
+            25, 75, 150, 300
+        ]}
+    ),
+
+    "Engineered Elastic Net": (
+        basic_prep,
+        ElasticNet(max_iter=30000),
+        {
+            "model__alpha": [0.005, 0.01, 0.02],
+            "model__l1_ratio": [0.5, 0.9]
+        }
+    ),
+
+    "Spline Ridge": (
+        spline_prep,
+        Ridge(),
+        {"model__alpha": [
+            10, 30, 100, 300
+        ]}
+    )
+}
+
+experiment_results = []
+experiment_models = {}
+
+for name, (prep, model, params) in experiments.items():
+
+    pipe = Pipeline([
+        ("preprocessing", prep),
+        ("model", model)
+    ])
+
+    grid = GridSearchCV(
+        pipe,
+        param_grid=params,
+        cv=5,
+        scoring="neg_root_mean_squared_error",
+        n_jobs=-1
+    )
+
+    grid.fit(X_train_eng, y_train)
+
+    experiment_models[name] = grid.best_estimator_
+
+    experiment_results.append({
+        "Model": name,
+        "CV RMSE": -grid.best_score_,
+        "Best Parameters": grid.best_params_
+    })
+
+# Compare new models
+experiment_df = pd.DataFrame(experiment_results)
+experiment_df = experiment_df.sort_values("CV RMSE")
+
+print("FEATURE ENGINEERING RESULTS")
+print(experiment_df.to_string(index=False))
+
+# Compare with previous LASSO
+previous_cv = 4.029032
+
+best_name = experiment_df.iloc[0]["Model"]
+best_cv = experiment_df.iloc[0]["CV RMSE"]
+
+print("\nPrevious LASSO CV RMSE:", previous_cv)
+print("Best New CV RMSE:", round(best_cv, 4))
+
+if best_cv < previous_cv:
+
+    best_model = experiment_models[best_name]
+
+    predictions = best_model.predict(X_test_eng)
+
+    new_test_rmse = np.sqrt(mean_squared_error(
+        y_test, predictions
+    ))
+
+    print("\nWinning Model:", best_name)
+    print("New Test RMSE:", round(new_test_rmse, 4))
+    print("Previous LASSO Test RMSE: 4.0971")
+
+else:
+    print("\nNo cross-validation improvement.")
+    print("Keep original LASSO as current best.")
+```
+
+```{python}
+# Diagnose and Fix Feature Engineering
+
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.model_selection import GridSearchCV
+
+# Inspect extreme values from previous experiment
+ratio_cols = [
+    "loan_income_ratio",
+    "credit_utilization_ratio",
+    "loan_per_credit_line"
+]
+
+print("ORIGINAL ENGINEERED FEATURE DISTRIBUTIONS")
+print(
+    X_train_eng[ratio_cols]
+    .describe(percentiles=[0.95, 0.99])
+    .T
+    .to_string()
+)
+
+# Create safer engineered features
+def safe_features(data):
+    x = data.copy()
+
+    # Log transformations
+    x["log_income"] = np.log1p(
+        x["annual_income"].clip(lower=0)
+    )
+
+    x["log_loan_amount"] = np.log1p(
+        x["loan_amount"].clip(lower=0)
+    )
+
+    x["log_credit_limit"] = np.log1p(
+        x["total_credit_limit"].clip(lower=0)
+    )
+
+    # Bounded ratios
+    x["loan_income_ratio"] = (
+        x["loan_amount"] /
+        x["annual_income"].clip(lower=10000)
+    ).clip(0, 5)
+
+    x["credit_utilization_ratio"] = (
+        x["total_credit_utilized"] /
+        x["total_credit_limit"].clip(lower=1000)
+    ).clip(0, 3)
+
+    return x.replace([np.inf, -np.inf], np.nan)
+
+# Rebuild features
+X_train_safe = safe_features(X_train)
+X_test_safe = safe_features(X_test)
+
+# Identify column types
+num_safe = X_train_safe.select_dtypes(
+    include=np.number
+).columns.tolist()
+
+cat_safe = X_train_safe.select_dtypes(
+    exclude=np.number
+).columns.tolist()
+
+# Preprocessing
+safe_prep = ColumnTransformer([
+    ("num", num_transformer, num_safe),
+    ("cat", cat_transformer, cat_safe)
+])
+
+# Test the models again
+safe_models = {
+    "Safe Ridge": (
+        Ridge(),
+        {"model__alpha": [25, 75, 150, 300, 600]}
+    ),
+
+    "Safe LASSO": (
+        Lasso(max_iter=30000),
+        {"model__alpha": [
+            0.003, 0.005, 0.01, 0.02, 0.05
+        ]}
+    ),
+
+    "Safe Elastic Net": (
+        ElasticNet(max_iter=30000),
+        {
+            "model__alpha": [0.005, 0.01, 0.03],
+            "model__l1_ratio": [0.5, 0.8, 0.95]
+        }
+    )
+}
+
+safe_results = []
+safe_best_models = {}
+
+for name, (model, params) in safe_models.items():
+
+    pipeline = Pipeline([
+        ("preprocessing", safe_prep),
+        ("model", model)
+    ])
+
+    grid = GridSearchCV(
+        pipeline,
+        param_grid=params,
+        cv=5,
+        scoring="neg_root_mean_squared_error",
+        n_jobs=-1
+    )
+
+    grid.fit(X_train_safe, y_train)
+
+    safe_best_models[name] = grid.best_estimator_
+
+    safe_results.append({
+        "Model": name,
+        "CV RMSE": -grid.best_score_,
+        "Best Parameters": grid.best_params_
+    })
+
+safe_df = pd.DataFrame(safe_results)
+safe_df = safe_df.sort_values("CV RMSE")
+
+print("\nCORRECTED FEATURE ENGINEERING RESULTS")
+print(safe_df.to_string(index=False))
+
+print("\nOriginal LASSO CV RMSE: 4.0290")
+print("Best New CV RMSE:",
+      round(safe_df.iloc[0]["CV RMSE"], 4))
+```
+
+```{python}
+# Step 8: Evaluate Best Engineered Model
+
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+# Select best model from cross-validation
+best_name = safe_df.iloc[0]["Model"]
+best_model = safe_best_models[best_name]
+
+# Predictions
+train_predictions = best_model.predict(X_train_safe)
+test_predictions = best_model.predict(X_test_safe)
+
+# Performance metrics
+train_rmse = np.sqrt(mean_squared_error(
+    y_train, train_predictions
+))
+
+test_rmse = np.sqrt(mean_squared_error(
+    y_test, test_predictions
+))
+
+test_mae = mean_absolute_error(
+    y_test, test_predictions
+)
+
+test_r2 = r2_score(
+    y_test, test_predictions
+)
+
+# Compare against previous best
+previous_best = 4.0971
+
+print("BEST MODEL:", best_name)
+print("Best Parameters:",
+      safe_df.iloc[0]["Best Parameters"])
+
+print("\nPERFORMANCE")
+print("Training RMSE:", round(train_rmse, 4))
+print("Cross-Validation RMSE:",
+      round(safe_df.iloc[0]["CV RMSE"], 4))
+print("Test RMSE:", round(test_rmse, 4))
+print("Test MAE:", round(test_mae, 4))
+print("Test R-Squared:", round(test_r2, 4))
+
+print("\nCOMPARISON")
+print("Previous Best Test RMSE:", previous_best)
+print("New Test RMSE:", round(test_rmse, 4))
+print("RMSE Improvement:",
+      round(previous_best - test_rmse, 4))
+```
+
+```{python}
+# Examine LASSO coefficients
+
+feature_names = best_model.named_steps[
+    "preprocessing"
+].get_feature_names_out()
+
+coefficients = best_model.named_steps[
+    "model"
+].coef_
+
+coef_df = pd.DataFrame({
+    "Feature": feature_names,
+    "Coefficient": coefficients
+})
+
+coef_df["Absolute Coefficient"] = (
+    coef_df["Coefficient"].abs()
+)
+
+coef_df = coef_df.sort_values(
+    "Absolute Coefficient", ascending=False
+)
+
+print("Total Features:", len(coef_df))
+print("Selected Features:",
+      (coef_df["Coefficient"] != 0).sum())
+print("Eliminated Features:",
+      (coef_df["Coefficient"] == 0).sum())
+
+print("\nTOP 20 COEFFICIENTS")
+display(coef_df.head(20))
+
+print("\nENGINEERED FEATURE COEFFICIENTS")
+display(coef_df[
+    coef_df["Feature"].str.contains(
+        "log_income|log_loan_amount|log_credit_limit|"
+        "loan_income_ratio|credit_utilization_ratio"
+    )
+])
+```
+
+
+### Practice Activity: Penalized Regression Results
+
+I developed regression models to predict Lending Club loan interest rates using Linear Regression, Ridge, LASSO, and Elastic Net.
+
+After exploring the dataset, I removed potential data leakage variables, handled missing values, standardized numerical predictors, and encoded categorical variables.
+
+I used GridSearchCV with five-fold cross-validation to tune regularization parameters.
+
+**Best Model: LASSO with Engineered Features**
+
+- Best alpha: 0.01
+- Training RMSE: 3.9212
+- Cross-validation RMSE: 3.9691
+- Test RMSE: 4.0144
+- Test MAE: 3.0919
+- Test R²: 0.3922
+
+The initial Linear Regression model produced a test RMSE of 4.1259. Through regularization and feature engineering, I reduced test RMSE to 4.0144, an improvement of approximately 2.70%.
+
+The final LASSO model retained 48 of 112 features and eliminated 64 by shrinking their coefficients to zero.
+
+The engineered credit utilization ratio, logarithmic income, logarithmic credit limit, loan-to-income ratio, and logarithmic loan amount were all retained.
+
+**Conclusion:** LASSO combined with feature engineering produced the best cross-validation results among the models tested. It reduced prediction error while performing automatic feature selection.
+
